@@ -1,8 +1,7 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 explicitly
 
 import cupy as cp
-import numpy as np
 import pandas as pd
 from cuml.neighbors import NearestNeighbors
 from scipy.special import digamma
@@ -10,58 +9,102 @@ from sklearn.preprocessing import minmax_scale
 import time
 import logging
 import warnings
-from tqdm import tqdm
 
 warnings.filterwarnings("ignore", message="All-NaN axis encountered")
+
+# Initialize logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# === Feature Selection Functions ===
+
+def load_dataset(filepath):
+    start_time = time.time()
+    logger.info(f"Loading dataset from {filepath}...")
+    df = pd.read_csv(filepath)
+    X = df.iloc[:, :-1].values  # Features
+    y = df.iloc[:, -1].values  # Target variable
+    logger.info(f"Dataset loaded in {time.time() - start_time:.4f} seconds.")
+    return cp.asarray(X), cp.asarray(y).reshape(-1, 1)
+
+
 def MIfeatureselection0(xMC, xMF, k, NoF):
     logger.info("Starting Mutual Information feature selection...")
     start_time = time.time()
+
     nf = xMF.shape[1]
+    # fVi holds the *1-based* indices of the remaining features
     fVi = cp.arange(1, nf + 1)
+
+    # Prepare containers for the selected features
     fM = cp.empty((xMF.shape[0], 0))
     fVs = cp.full((NoF,), cp.nan)
     fVMI = cp.full((NoF,), cp.nan)
 
     for i in range(NoF):
-        mi = cp.full((fVi.size,), cp.nan)
-        for j in range(fVi.size):
-            idx = fVi[j] - 1
-            if cp.isnan(cp.sum(xMF[:, idx])):
+        # Allocate MI array only for the features that remain in fVi
+        current_size = fVi.size
+        mi = cp.full((current_size,), cp.nan)
+
+        # Compute MI for each remaining feature
+        for j in range(current_size):
+            # Remember fVi is 1-based; we convert to 0-based by subtracting 1
+            feature_index_0_based = fVi[j] - 1
+
+            # Ensure we skip NaN or invalid columns
+            if cp.isnan(cp.sum(xMF[:, feature_index_0_based])):
                 continue
-            noisy_feature = xMF[:, idx] + cp.random.normal(0, 1e-5, xMF.shape[0])
-            mi_local, _, _ = cmikra1n(xMC, noisy_feature, fM, k)
+
+            # Add a small noise to break ties, as your original code suggests
+            noisy_xMF_j = xMF[:, feature_index_0_based] + cp.random.normal(0, 10**-5, xMF.shape[0])
+
+            # Compute MI with cmikra1n
+            mi_local, _, _ = cmikra1n(xMC, noisy_xMF_j, fM, k)
             mi[j] = mi_local
 
-        max_idx = cp.nanargmax(mi)
-        max_val = mi[max_idx]
+        # Identify the feature with maximum MI
+        MaxMI = cp.nanargmax(mi)
+        max_val = mi[MaxMI]
+
         if cp.isnan(max_val):
-            logger.warning("All MI values are NaN. Stopping.")
+            logger.warning(f"All MI values are NaN at iteration {i}. Stopping early.")
             break
 
-        best_feature = fVi[max_idx]
+        # Get the actual feature id from fVi
+        best_feature = fVi[MaxMI]
+        logger.info(f"Iteration {i}: best_feature={best_feature}, max_MI={max_val}")
+
+        # Append this selected feature to fM
         fM = cp.hstack((fM, cp.expand_dims(xMF[:, best_feature - 1], axis=1)))
         fVs[i] = best_feature
         fVMI[i] = max_val
-        fVi = cp.delete(fVi, max_idx)
 
-    logger.info(f"Completed in {time.time() - start_time:.2f} sec.")
+        # Remove the chosen feature from the pool
+        fVi = cp.delete(fVi, MaxMI)  # remove by index, not by value
+
+    logger.info(f"Feature selection completed in {time.time() - start_time:.4f} seconds.")
+    # Return the selected features and their MI values
     return cp.vstack((fVs, fVMI))
+
 
 def cmikra1n(xM, yM, zM, k):
     if zM.shape[1] == 0:
         mi = mkraskov1(xM, yM, k)
         return mi[0], [cp.nan, cp.nan], 0
-    xMb = cp.concatenate((xM, yM.reshape(-1,1), zM), axis=1)
+
+    xM = xM.reshape(-1, 1) if xM.ndim == 1 else xM
+    yM = yM.reshape(-1, 1) if yM.ndim == 1 else yM
+
+    xMb = cp.concatenate((xM, yM, zM), axis=1)
     maxdistV = gpu_kd_tree_knn(xMb, k)
+
     nz = npoinmultranges(zM, maxdistV, k)
-    nyz = npoinmultranges(cp.concatenate((yM.reshape(-1,1), zM), axis=1), maxdistV, k)
+    nyz = npoinmultranges(cp.concatenate((yM, zM), axis=1), maxdistV, k)
     nxz = npoinmultranges(cp.concatenate((xM, zM), axis=1), maxdistV, k)
+
     mi = digamma(k) - cp.mean(digamma(nxz) + digamma(nyz) - digamma(nz))
-    return mi, [digamma(nz), digamma(nyz)], cp.corrcoef(xM.T, yM.T)[0,1]
+
+    return mi, [digamma(nz), digamma(nyz)], cp.corrcoef(xM.T, yM.T)[0, 1]
+
 
 def gpu_kd_tree_knn(data, k):
     model = NearestNeighbors(n_neighbors=k + 1, algorithm='brute')
@@ -69,105 +112,43 @@ def gpu_kd_tree_knn(data, k):
     distances, _ = model.kneighbors(data)
     return distances[:, -1]
 
+
 def npoinmultranges(xM, rV, k):
-    n = xM.shape[0]
-    model = NearestNeighbors(n_neighbors=n, algorithm='brute')
+    n_samples = xM.shape[0]
+    model = NearestNeighbors(n_neighbors=n_samples, algorithm='brute')
     model.fit(xM)
-    distances,_= model.kneighbors(xM)
-    return cp.asarray(cp.sum(distances <= rV[:, None], axis=1), dtype=cp.float64)
+    distances, _ = model.kneighbors(xM)
+    within_radius = (distances <= rV[:, None])
+    return cp.asarray(cp.sum(within_radius, axis=1), dtype=cp.float64)
+
 
 def mkraskov1(xM1, xM2, k):
-    xMb = cp.concatenate((xM1, xM2.reshape(-1,1)), axis=1)
+    n1 = xM1.shape[0]
+
+    if xM2.ndim == 1:
+        xM2 = xM2[:, cp.newaxis]
+
+    xMb = cp.concatenate((xM1, xM2), axis=1)
     maxdistV = gpu_kd_tree_knn(xMb, k)
+
     topsi1 = npoinmultranges(xM1, maxdistV, k)
-    topsi2 = npoinmultranges(xM2.reshape(-1,1), maxdistV, k)
-    mi = digamma(k) + digamma(xM1.shape[0]) - cp.mean(digamma(topsi1) + digamma(topsi2))
+    topsi2 = npoinmultranges(xM2, maxdistV, k)
+
+    mi = digamma(k) + digamma(n1) - cp.mean(digamma(topsi1) + digamma(topsi2))
     return mi, topsi1, topsi2
 
-# === Dataset Generators ===
-def binarize_y(yV, bins):
-    xYY = np.linspace(min(yV), max(yV), bins + 1)
-    y2V = np.zeros(len(yV), dtype=int)
-    for i in range(bins):
-        y2V[(yV >= xYY[i]) & (yV <= xYY[i+1])] = i + 1
-    if bins == 2 and np.max(y2V) == 2:
-        y2V[y2V != 1] = 2
-    return y2V
 
-def generate_dataset(seed, bins, dataset_type):
-    rng = np.random.default_rng(seed)  # Local random generator
+#####################Configuration of parameters to enable proper execution of PCMINN ###########################################################
 
-    if dataset_type == 'A':
-        n, m_total, rho, coef = 10000, 22, 0.5, 0.5
-        SigM = rho * np.ones((m_total, m_total)) + (1 - rho) * np.eye(m_total)
-        xM = rng.multivariate_normal(np.zeros(m_total), SigM, n)
-        y1 = -3*xM[:,0] + 2*xM[:,1] + rng.normal(size=n)
-        y2 = 3*xM[:,2] + 2*xM[:,3] - 4*xM[:,4] + rng.normal(size=n)
-        yV = coef * y1 + (1 - coef) * y2
+#initidx is the class variable
+#xM refers to the features
+#if len(initidx.shape) == 1:         #check the dimensions, to avoid problems with np.concatenate
+ #   xMC = initidx.reshape(-1, 1)
+#if len(xM.shape) == 1:
+ #   xM = xM.reshape(-1, 1)
+#nf = xM.shape[1]
+#xMC = minmax_scale(xMC)   ############# Scaling the variables to a common range to avoid bias
+#xM = minmax_scale(xM, axis=0)     ####### 
 
-    elif dataset_type == 'B':
-        n, m_total = 10000, 22
-        xM = rng.normal(0, 1, (n, m_total))
-        f1, f2 = xM[:,0], xM[:,1]
-        f3 = 0.2*f1 + 0.3*f2 + 2.0*xM[:,2]
-        f4 = 0.1*f1**2 + 0.1*f2**2
-        xM[:,2], xM[:,3] = f3, f4
-        yV = f1 + f2 + 0.2*f3 + 0.3*f4 + rng.normal(size=n)
-
-    else:  # Dataset type C
-        n, m_total = 1000, 30
-        fM = np.full((n, m_total), np.nan)
-        x1M = rng.normal(0, 1, (n, 5))
-        x5 = rng.normal(0, 1, n) * rng.normal(0, 1, n)
-        x1, x2, x3, x4 = x1M[:,0], x1M[:,1], x1M[:,2], x1M[:,3]
-        fM[:,0:6] = np.column_stack([x1, x2, x1*x2, x3, x4**2, x1*x5])
-        fM[:,6:12] = 0.8 * fM[:,0:6] + np.sqrt(1 - 0.8**2) * rng.normal(0, 1, (n, 6))
-        fM[:,12:18] = 0.4 * fM[:,0:6] + np.sqrt(1 - 0.4**2) * rng.normal(0, 1, (n, 6))
-        fM[:,18:] = rng.normal(0, 1, (n, 12))
-        std_f = np.std(fM[:, 0:6], axis=0)
-        bi = 1 / std_f
-        yV = np.sum(bi * fM[:, 0:6], axis=1) + rng.normal(size=n)
-        xM = fM
-
-    y_bin = binarize_y(yV, bins).reshape(-1, 1)
-    xM = minmax_scale(xM)
-    y_bin = minmax_scale(y_bin)
-    return cp.asarray(xM), cp.asarray(y_bin)
-
-# === Main Runner ===
-dataset_configs = [("A", 5), ("B", 4), ("C", 6)]
-bins_list = [2, 10]
-base_path = "/home/pptower/mlops/data"
-pcminn_root = os.path.join(base_path, "PCMINN")
-
-
-for bins in bins_list:
-    for name, NoF in dataset_configs:
-        logger.info(f"\n--- Running Dataset {name} with {bins} bins ---")
-        output_dir = os.path.join(base_path, f"PCMINN_{name}_{bins}bin")
-        os.makedirs(output_dir, exist_ok=True)
-
-        execution_times = []
-        outputs = []
-
-        
-        for i in tqdm(range(100), desc=f"{name}_{bins}bin"):
-            try:
-                seed = 5 + i
-                X, y = generate_dataset(seed, bins, name)
-                start_time = time.time()
-                selected = MIfeatureselection0(y, X, k=20, NoF=NoF)
-                duration = time.time() - start_time
-                execution_times.append(duration)
-                outputs.append(cp.asnumpy(selected))
-            except Exception as e:
-                logger.error(f"Run {i+1} failed: {str(e)}")
-                execution_times.append(None)
-                outputs.append([None] * NoF * 2)
-
-        df_times = pd.DataFrame({'Run': list(range(1, 101)), 'ExecutionTime': execution_times})
-        df_outputs = pd.DataFrame([out.flatten() if out is not None else [None]*NoF*2 for out in outputs])
-        df_times.to_csv(os.path.join(output_dir, "execution_times.csv"), index=False)
-        df_outputs.to_csv(os.path.join(output_dir, "selected_features_runs.csv"), index=False)
-        logger.info(f"✅ Saved results for Dataset {name} with {bins} bins\n")
-
+#For PCMINN GPU.
+#xMC, xM = cp.asarray(xMC), cp.asarray(xM)
